@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyrouteforge"
+version = "1.1.0"
+description = "A Clean and Fast Vehicle Routing Problem Solver Powered by Genetic Algorithms."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Valdecy Pereira" },
+]
+maintainers = [
+    { name = "Valdecy Pereira" },
+]
+keywords = [
+    "vrp",
+    "tsp",
+    "mtsp",
+    "vehicle-routing",
+    "routing",
+    "logistics",
+    "optimization",
+    "genetic-algorithm",
+    "metaheuristic",
+    "operations-research",
+    "plotly",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = [
+    "numpy>=1.20",
+    "pandas>=1.3",
+    "plotly>=5.0",
+	"numba>=0.55",
+	"folium>=0.14",
+]
+
+[project.optional-dependencies]
+
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "build>=1.0",
+    "twine>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Valdecy/pyRouteForge"
+Repository = "https://github.com/Valdecy/pyRouteForge"
+Issues = "https://github.com/Valdecy/pyRouteForge/issues"
+
+[tool.setuptools.packages.find]
+include = ["pyrouteforge*"]
+
+
