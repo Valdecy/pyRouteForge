@@ -4,13 +4,14 @@
 
 pyRouteForge solves a wide family of routing problems with a single function call:
 
-- **Capacitated VRP** — assign customers to a vehicle fleet with capacity limits
-- **Multi-Depot VRP** — multiple starting depots, depot auto-assignment per route
-- **VRP with Time Windows** — earliest/latest arrival, service times, waiting costs
-- **Heterogeneous Fleet** — mix vehicle types with different capacities, costs, speeds
-- **Finite or Infinite Fleet** — set hard limits on vehicle counts or leave them open
-- **Open or Closed Routes** — return to depot or finish at the last customer
-- **TSP / mTSP** — classical Travelling Salesman variants
+- **Capacitated VRP** —  ([ Colab Demo ](https://colab.research.google.com/drive/1UvOtkRnjPF5PUi9A4yd2Yg1EZ3EBJv-F?usp=sharing)) — Assign customers to a vehicle fleet with capacity limits
+- **Multi-Depot VRP** —  ([ Colab Demo ](https://colab.research.google.com/drive/1kQvpiv_oCNK3aq1-BJtIq7Rshs6qIZK1?usp=sharing)) — Multiple starting depots, depot auto-assignment per route
+- **VRP with Time Windows** —  ([ Colab Demo ](https://colab.research.google.com/drive/1OMiw2l-SR4w8CFrkPF80BdcVz13UpDMe?usp=sharing)) — Earliest/latest arrival, service times, waiting costs
+- **Heterogeneous Fleet** —  ([ Colab Demo ](https://colab.research.google.com/drive/16vgnJQHq4HtQmRFvCWIUCDUuiU0BVD8l?usp=sharing)) — Mix vehicle types with different capacities, costs, speeds
+- **Finite or Infinite Fleet** —  ([ Colab Demo ](https://colab.research.google.com/drive/1pQHW2qvaXFQzvdMdJjQzifYs1BOtKfoh?usp=sharing)) — Set hard limits on vehicle counts or leave them open
+- **TSP** —  ([ Colab Demo ](https://colab.research.google.com/drive/1X_MIsZHJum4-zBOm64inQ_bOK5oeFVSC?usp=sharing)) — Classical Travelling Salesman
+- **mTSP** —  ([ Colab Demo ](https://colab.research.google.com/drive/1k0KJVfuP2rStTA10JOEDfEVNjBUBQqm9?usp=sharing)) — Multi-Depot Travelling Salesman
+- **Open or Closed Routes** —  ([ Colab Demo ](https://colab.research.google.com/drive/1cA19MoR2j8slce0iiN21iSP4HFg8Tx-7?usp=sharing)) — Return to depot or finish at the last customer
 
 ---
 
@@ -44,15 +45,15 @@ df = pd.DataFrame({
 				  })
 
 result = solve(
-				locations     = df,
-				n_depots      = 1,
-				capacity      = 150,
-				fixed_cost    = 30,
-				variable_cost = 2,
-				velocity      = 70,
-				generations   = 300,
-				seed          = 42,
-			  )
+					locations     = df,
+					n_depots      = 1,
+					capacity      = 150,
+					fixed_cost    = 30,
+					variable_cost = 2,
+					velocity      = 70,
+					generations   = 300,
+					seed          = 42,
+			   )
 
 print(f"Total Distance: {result.total_distance:.2f}")
 result.plot().show()         
@@ -73,7 +74,7 @@ Route #1: depot = 0, vehicle = 0, load = 130, distance = 152.66, stops = [5, 3, 
 
 `solve()` is deliberately flexible. Whatever you have on hand, it'll work.
 
-### 1. A pandas DataFrame (recommended)
+### a. A pandas DataFrame (recommended)
 
 The most natural format. pyRouteForge auto-detects column names:
 
@@ -88,17 +89,21 @@ The most natural format. pyRouteForge auto-detects column names:
 | Waiting cost        | `tw_wait_cost`, `wait_cost`, `waiting_cost`                   |
 | Display label       | `name`, `label`, `id`                                         |
 
-If your DataFrame contains any of the time-window columns, pyRouteForge automatically switches into VRPTW mode (override with `time_window='without'` if you want to ignore them).
 
-### 2. A numpy array of coordinates
+### b. A numpy array of coordinates
 
 ```python
 import numpy as np
-arr    = np.array([[40, 50], [25, 85], [22, 75], [22, 85]])
+arr    = np.array([
+                    [40, 50], 
+					[25, 85], 
+					[22, 75], 
+					[22, 85]
+			      ])
 result = solve(locations = arr, demand = [0, 20, 30, 10], capacity = 100)
 ```
 
-### 3. A precomputed distance matrix
+### c. A precomputed distance matrix
 
 When your network isn't Euclidean (real-world driving distances, sea routes, etc.):
 
@@ -141,8 +146,6 @@ result = solve(
 				)
 ```
 
-The GA picks the cheapest feasible vehicle for each route automatically.
-
 ---
 
 ## Working with the result
@@ -150,20 +153,20 @@ The GA picks the cheapest feasible vehicle for each route automatically.
 `solve()` returns a `Solution` with everything you need:
 
 ```python
-result.total_distance     # float
-result.total_cost         # float
-result.n_routes           # int
-result.routes             # list of dicts: route_id, vehicle_type, depot, stops, load, distance
-result.report             # pandas DataFrame: per-stop schedule (load, arrival/leave times, etc.)
-result.history            # list[float] — best distance per generation
-result.coordinates        # np.ndarray — the (n, 2) layout used for plotting
-result.raw                # internal [depots, routes, vehicles] structure (advanced use)
+result.total_distance      # float
+result.total_cost          # float
+result.n_routes            # int
+result.routes              # list of dicts: route_id, vehicle_type, depot, stops, load, distance
+result.report              # pandas DataFrame: per-stop schedule (load, arrival/leave times, etc.)
+result.history             # list[float] — best distance per generation
+result.coordinates         # np.ndarray — the (n, 2) layout used for plotting
+result.raw                 # internal [depots, routes, vehicles] structure (advanced use)
 
 # Plotting
-result.plot()                  # main route map
-result.plot_convergence()      # GA fitness curve
-result.plot_loads(             # bar chart of load vs capacity per route
-					capacity    = [150],
+result.plot()              # main route map
+result.plot_convergence()  # GA fitness curve
+result.plot_loads(         # bar chart of load vs capacity per route
+					capacity   = [150],
 					parameters = problem.parameters,
 				 )
 
@@ -178,7 +181,7 @@ result.to_csv("routes.csv")
 All figures are `plotly.graph_objects.Figure` instances:
 
 ```python
-fig = result.plot(title = "My Solution", width = 1100, height = 750)
+fig = result.plot(title = "Solution", width = 1100, height = 750)
 fig.show()                                 # Jupyter / Colab inline
 fig.write_html("solution.html")            # standalone HTML
 fig.write_image("solution.png", scale = 2) # requires kaleido
@@ -193,50 +196,6 @@ The default styling is a dark theme with:
 - **Equal-aspect axes** so geometry isn't distorted
 
 Customize anything by accessing `fig.layout` / `fig.data` directly — it's just Plotly underneath.
-
-### Google Colab
-
-Plotly figures render natively in Colab:
-
-```python
-!pip install pyrouteforge
-import pandas as pd
-from pyrouteforge import solve
-
-# ... build df ...
-result = solve(locations = df, capacity = 100, generations = 300)
-result.plot()   # renders inline
-```
-
----
-
-## Problem variants
-
-### TSP (single salesman)
-
-```python
-result = solve(locations = df, model = "tsp", generations = 200)
-print(result.routes[0]["stops"])   # the tour order
-```
-
-### mTSP (multiple salesmen, no capacity)
-
-```python
-result = solve(locations = df, model = "mtsp", generations = 200)
-```
-
-### Open routes (no return to depot)
-
-```python
-result = solve(locations = df, capacity = 100, route = "open")
-```
-
-### Multi-depot VRP
-
-```python
-# First 3 rows of df are treated as depots.
-result = solve(locations = df, n_depots = 3, capacity = 100)
-```
 
 ---
 
