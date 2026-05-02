@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyrouteforge"
-version = "1.1.0"
+version = "1.2.1"
 description = "A Clean and Fast Vehicle Routing Problem Solver Powered by Genetic Algorithms."
 readme = "README.md"
 requires-python = ">=3.8"
