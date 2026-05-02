@@ -31,7 +31,7 @@ from .core import Solution, solve
 from .data import Problem
 from .plotting import plot_convergence, plot_routes, plot_vehicle_loads
 
-__version__ = "1.2.1"
+__version__ = "1.2.3"
 
 __all__ = [
     "solve",
