@@ -629,6 +629,191 @@ def crossover_vrp_bcr(parent_1, parent_2, distance_matrix, velocity, capacity, f
             del offspring[2][i]
     return offspring
 
+
+
+def _route_penalty_cost(distance_matrix, parameters, depot, subroute, vehicle_idx,
+                        velocity, fixed_cost, variable_cost, capacity,
+                        penalty_value, time_window, route):
+    dist = evaluate_distance(distance_matrix, depot, subroute)
+    if time_window == 'with':
+        wait, time = evaluate_time(distance_matrix, parameters, depot, subroute, velocity=[velocity[vehicle_idx]])
+    else:
+        wait, time = [], []
+    cap = evaluate_capacity(parameters, depot, subroute)
+    return evaluate_cost_penalty(
+        dist, time, wait, cap, capacity[vehicle_idx], parameters, depot, subroute,
+        [fixed_cost[vehicle_idx]], [variable_cost[vehicle_idx]], penalty_value,
+        time_window, route,
+    )
+
+
+def _compact_individual(individual):
+    solution = [[], [], []]
+    for d, r, v in zip(individual[0], individual[1], individual[2]):
+        if len(r) > 0:
+            solution[0].append(d[:])
+            solution[1].append(r[:])
+            solution[2].append(v[:])
+    return solution
+
+
+def _remove_customers(individual, removed_set):
+    new_ind = [[], [], []]
+    for d, route_nodes, v in zip(individual[0], individual[1], individual[2]):
+        nr = [c for c in route_nodes if c not in removed_set]
+        if nr:
+            new_ind[0].append(d[:])
+            new_ind[1].append(nr)
+            new_ind[2].append(v[:])
+    return new_ind
+
+
+def _related_removal(individual, q, distance_matrix, parameters, time_window):
+    routes = individual[1]
+    nodes = [c for r in routes for c in r]
+    if not nodes:
+        return []
+    seed = random.choice(nodes)
+    route_of = {}
+    for ridx, r in enumerate(routes):
+        for c in r:
+            route_of[c] = ridx
+    tw_early = parameters[:, 1]
+    tw_late = parameters[:, 2]
+    scored = []
+    for c in nodes:
+        if c == seed:
+            continue
+        score = float(distance_matrix[seed, c])
+        if time_window == 'with':
+            score += 0.1 * abs(float(tw_early[seed]) - float(tw_early[c]))
+            score += 0.1 * abs(float(tw_late[seed]) - float(tw_late[c]))
+        if route_of.get(c) == route_of.get(seed):
+            score *= 0.7
+        score *= (0.9 + 0.2 * random.random())
+        scored.append((score, c))
+    scored.sort(key=lambda x: x[0])
+    removed = [seed] + [c for _, c in scored[:max(0, q - 1)]]
+    return removed[:q]
+
+
+def _best_insertions_for_customer(individual, customer, distance_matrix, parameters,
+                                  velocity, fixed_cost, variable_cost, capacity,
+                                  penalty_value, time_window, route,
+                                  vehicle_types, n_depots, fleet_size):
+    candidates = []
+    counts = [0] * max(vehicle_types, len(fleet_size), 1)
+    for veh in individual[2]:
+        if veh and veh[0] < len(counts):
+            counts[veh[0]] += 1
+
+    # existing routes
+    for m in range(len(individual[1])):
+        depot_p = individual[0][m]
+        veh_p = individual[2][m][0]
+        base_route = individual[1][m]
+        old_cost = _route_penalty_cost(distance_matrix, parameters, depot_p, base_route,
+                                       veh_p, velocity, fixed_cost, variable_cost,
+                                       capacity, penalty_value, time_window, route)
+        n_pos = len(base_route) + 1
+        insertion_list = [base_route[:n] + [customer] + base_route[n:] for n in range(n_pos)]
+        for pos, cand_route in enumerate(insertion_list):
+            new_cost = _route_penalty_cost(distance_matrix, parameters, depot_p, cand_route,
+                                           veh_p, velocity, fixed_cost, variable_cost,
+                                           capacity, penalty_value, time_window, route)
+            candidates.append((new_cost - old_cost, ('insert', m, pos)))
+
+    # new route candidates
+    for d in range(n_depots):
+        depot = [d]
+        for veh in range(vehicle_types):
+            extra = 0
+            if len(fleet_size) > 0 and veh < len(fleet_size) and counts[veh] >= fleet_size[veh]:
+                extra = penalty_value
+            new_cost = _route_penalty_cost(distance_matrix, parameters, depot, [customer], veh,
+                                           velocity, fixed_cost, variable_cost, capacity,
+                                           penalty_value, time_window, route)
+            candidates.append((new_cost + extra, ('new', d, veh)))
+
+    candidates.sort(key=lambda x: x[0])
+    if not candidates:
+        return None, None
+    best = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else (best[0] + penalty_value, best[1])
+    return best, second
+
+
+def _apply_insertion(individual, customer, action):
+    kind = action[0]
+    if kind == 'insert':
+        _, m, pos = action
+        individual[1][m][pos:pos] = [customer]
+    else:
+        _, d, veh = action
+        individual[0].append([d])
+        individual[1].append([customer])
+        individual[2].append([veh])
+    return individual
+
+
+def ruin_recreate(individual, distance_matrix, parameters, velocity, fixed_cost,
+                  variable_cost, capacity, penalty_value, time_window, route,
+                  vehicle_types, n_depots, fleet_size, ruin_fraction=0.15):
+    # only meaningful for VRP-like variants
+    customers = [c for r in individual[1] for c in r]
+    n_customers = len(customers)
+    if n_customers <= 2:
+        return _clone(individual)
+    q = max(1, min(n_customers - 1, int(round(ruin_fraction * n_customers))))
+    if random.random() < 0.5:
+        removed = random.sample(customers, q)
+    else:
+        removed = _related_removal(individual, q, distance_matrix, parameters, time_window)
+        if len(removed) < q:
+            remset = set(removed)
+            pool = [c for c in customers if c not in remset]
+            if pool:
+                removed.extend(random.sample(pool, min(q - len(removed), len(pool))))
+    removed_set = set(removed)
+    partial = _remove_customers(individual, removed_set)
+    to_insert = removed[:]
+    random.shuffle(to_insert)
+
+    while to_insert:
+        best_choice = None
+        best_regret = -float('inf')
+        best_customer = None
+        for customer in to_insert:
+            best, second = _best_insertions_for_customer(
+                partial, customer, distance_matrix, parameters, velocity,
+                fixed_cost, variable_cost, capacity, penalty_value,
+                time_window, route, vehicle_types, n_depots, fleet_size,
+            )
+            if best is None:
+                continue
+            regret = second[0] - best[0]
+            # biased toward good best insertion when regrets tie
+            key = (regret, -best[0])
+            if best_choice is None or key > best_regret:
+                best_choice = best
+                best_regret = key
+                best_customer = customer
+        if best_choice is None:
+            break
+        partial = _apply_insertion(partial, best_customer, best_choice[1])
+        to_insert.remove(best_customer)
+
+    partial = _compact_individual(partial)
+    if n_depots > 1:
+        partial = evaluate_depot(n_depots, partial, distance_matrix)
+    if vehicle_types > 1:
+        partial = evaluate_vehicle(vehicle_types, partial, distance_matrix, parameters,
+                                   velocity, fixed_cost, variable_cost, capacity,
+                                   penalty_value, time_window, route, fleet_size)
+    partial = cap_break(vehicle_types, partial, parameters, capacity)
+    return partial
+
+
 # Function: Breeding
 def breeding(cost, population, fitness, distance_matrix, n_depots, elite, velocity, capacity, fixed_cost, variable_cost, penalty_value, time_window, parameters, route, vehicle_types, fleet_size):
     offspring = [_clone(p) for p in population]
@@ -766,9 +951,20 @@ def genetic_algorithm_vrp(coordinates, distance_matrix, parameters, velocity, fi
     elite_cst        = cost[0][0]
     solution         = _clone(population[0])
     print('Generation = ', count, ' Distance = ', elite_ind, ' f(x) = ', round(elite_cst, 2))
+    stall = 0
     while (count <= generations-1):
         offspring        = breeding(cost, population, fitness, distance_matrix, n_depots, elite, velocity, max_capacity, fixed_cost, variable_cost, penalty_value, time_window, parameters, route, vehicle_types, fleet_size)
         offspring        = mutation(offspring, mutation_rate = mutation_rate, elite = elite)
+        if model not in ('tsp', 'mtsp') and stall >= (8 if time_window == 'with' else 12):
+            rr_targets = min(2, len(offspring) - elite)
+            for rr_idx in range(rr_targets):
+                base_ind = solution if rr_idx == 0 else population[min(rr_idx, len(population)-1)]
+                offspring[-1 - rr_idx] = ruin_recreate(
+                    _clone(base_ind), distance_matrix, parameters, velocity, fixed_cost,
+                    variable_cost, max_capacity, penalty_value, time_window, route,
+                    vehicle_types, n_depots, list(fleet_size),
+                    ruin_fraction=(0.12 + 0.02 * min(stall, 8)) if time_window == 'with' else (0.15 + 0.02 * min(stall, 8)),
+                )
         cost, population = target_function(offspring, distance_matrix, parameters, velocity, fixed_cost, variable_cost, max_capacity, penalty_value, time_window = time_window, route = route, fleet_size = fleet_size)
         cost, population = (list(t) for t in zip(*sorted(zip(cost, population))))
         if (selection == 'rw'):
@@ -781,6 +977,9 @@ def genetic_algorithm_vrp(coordinates, distance_matrix, parameters, velocity, fi
             elite_ind = elite_child
             solution  = _clone(population[0])
             elite_cst = cost[0][0]
+            stall = 0
+        else:
+            stall += 1
         count = count + 1
         print('Generation = ', count, ' Distance = ', elite_ind, ' f(x) = ', round(elite_cst, 2))
     if (graph == True):
@@ -884,6 +1083,7 @@ def run_genetic_algorithm(
         on_generation(0, elite_ind, elite_cst)
 
     count = 0
+    stall = 0
     while count <= generations - 1:
         offspring = breeding(
             cost,
@@ -904,6 +1104,16 @@ def run_genetic_algorithm(
             list(fleet_size),
         )
         offspring = mutation(offspring, mutation_rate=mutation_rate, elite=elite)
+        if model not in ('tsp', 'mtsp') and stall >= (8 if time_window == 'with' else 12):
+            rr_targets = min(2, len(offspring) - elite)
+            for rr_idx in range(rr_targets):
+                base_ind = solution if rr_idx == 0 else population[min(rr_idx, len(population)-1)]
+                offspring[-1 - rr_idx] = ruin_recreate(
+                    _clone(base_ind), distance_matrix, params, velocity, fixed_cost,
+                    variable_cost, max_capacity, penalty_value, time_window, route,
+                    vehicle_types, n_depots, list(fleet_size),
+                    ruin_fraction=(0.12 + 0.02 * min(stall, 8)) if time_window == 'with' else (0.15 + 0.02 * min(stall, 8)),
+                )
         cost, population = target_function(
             offspring,
             distance_matrix,
@@ -928,6 +1138,9 @@ def run_genetic_algorithm(
             elite_ind = elite_child
             solution = _clone(population[0])
             elite_cst = cost[0][0]
+            stall = 0
+        else:
+            stall += 1
         count += 1
         history.append(elite_ind)
         if verbose:
