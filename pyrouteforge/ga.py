@@ -1,46 +1,36 @@
+
 """
-Genetic algorithm core for routing problems.
+Hybrid genetic search core for routing problems.
 
-Internal module — users interact with :func:`routeforge.solve`. The
-algorithm is a port of Valdecy Pereira's well-tested implementation,
-restructured for readability and packaged so the heavy inner loops
-benefit from numba (when installed) via ``_kernels``.
+Public API compatibility is preserved through ``run_genetic_algorithm``.
+Internally this module now uses case-aware giant-tour decoding plus local
+search instead of the legacy route-list crossover/mutation scheme.
 
-An "individual" is a triple of equal-length lists::
+Design by case
+--------------
+* TSP   : OX crossover + inversion/swap mutation + 2-opt local search
+* mTSP  : giant-tour + split decoder (+ exact route count when fleet_size given)
+* VRP   : giant-tour + split decoder + relocate/swap/2-opt local search
+* VRPTW : same as VRP, but route evaluation and repairs are time-window aware
 
-    [
-        [[depot_idx], ...],         # one per route
-        [[client_idx, ...], ...],   # client visit order, one list per route
-        [[vehicle_type_idx], ...],  # one per route
-    ]
+The returned solution still uses the legacy raw format expected by plotting:
+    [ [[depot], ...], [[client,...], ...], [[vehicle_type], ...] ]
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import math
 import random
 import time as tm
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from ._kernels import route_cost_basic, route_cost_time_windows
-
 
 # ---------------------------------------------------------------------------
-# Individual cloning (replaces deepcopy on the hot path)
-# ---------------------------------------------------------------------------
-
-def _clone_individual(ind):
-    return [
-        [lst[:] for lst in ind[0]],
-        [lst[:] for lst in ind[1]],
-        [lst[:] for lst in ind[2]],
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Route-level evaluators (used in reporting)
+# Legacy-compatible report helpers
 # ---------------------------------------------------------------------------
 
 def _evaluate_distance(distance_matrix, depot, subroute):
@@ -68,7 +58,7 @@ def _evaluate_time(distance_matrix, parameters, depot, subroute, velocity):
     for i in range(1, L):
         prev = nodes[i - 1]
         cur = nodes[i]
-        t = time[i - 1] + distance_matrix[prev, cur] / vel
+        t = time[i - 1] + distance_matrix[prev, cur] / max(vel, 1e-12)
         if t < tw_early[cur]:
             wait[i] = tw_early[cur] - t
             t = tw_early[cur]
@@ -96,441 +86,6 @@ def _evaluate_cost(dist, wait, parameters, depot, subroute,
             for i in range(len(subroute_))
         ]
     return [fc if x == 0 else fc + x * vc for x in dist]
-
-
-def _route_demand_sum(subroute, demand_col):
-    return sum(demand_col[node] for node in subroute)
-
-
-def _single_route_penalised_cost(distance_matrix, parameters, velocity, fixed_cost,
-                                 variable_cost, capacity, penalty_value, time_window,
-                                 route, depot, subroute, v_type):
-    if not subroute:
-        return 0.0
-    demand = parameters[:, 0]
-    sub_arr = np.asarray(subroute, dtype=np.int64)
-    closed = 0 if route == "open" else 1
-    if time_window == "with":
-        return float(route_cost_time_windows(
-            distance_matrix, demand,
-            parameters[:, 1], parameters[:, 2], parameters[:, 3], parameters[:, 4],
-            depot[0], sub_arr, velocity[v_type], fixed_cost[v_type],
-            variable_cost[v_type], capacity[v_type], penalty_value, closed,
-        ))
-    return float(route_cost_basic(
-        distance_matrix, demand, depot[0], sub_arr,
-        fixed_cost[v_type], variable_cost[v_type], capacity[v_type],
-        penalty_value, closed,
-    ))
-
-
-# ---------------------------------------------------------------------------
-# Greedy fixers between generations
-# ---------------------------------------------------------------------------
-
-def _reassign_depots(n_depots, individual, distance_matrix):
-    for j in range(len(individual[1])):
-        subroute = individual[1][j]
-        best_d = float("inf")
-        best = individual[0][j][0]
-        for i in range(n_depots):
-            d = _evaluate_distance(distance_matrix, [i], subroute)[-1]
-            if d < best_d:
-                best_d, best = d, i
-        individual[0][j] = [best]
-    return individual
-
-
-def _reassign_vehicles(vehicle_types, individual, distance_matrix, parameters,
-                       velocity, fixed_cost, variable_cost, capacity, penalty_value,
-                       time_window, route):
-    for i in range(len(individual[0])):
-        depot = individual[0][i]
-        subroute = individual[1][i]
-        current = individual[2][i][0]
-        best_v = current
-        best_c = _single_route_penalised_cost(
-            distance_matrix, parameters, velocity, fixed_cost, variable_cost,
-            capacity, penalty_value, time_window, route, depot, subroute, current,
-        )
-        for j in range(vehicle_types):
-            if j == current:
-                continue
-            c = _single_route_penalised_cost(
-                distance_matrix, parameters, velocity, fixed_cost, variable_cost,
-                capacity, penalty_value, time_window, route, depot, subroute, j,
-            )
-            if c < best_c:
-                best_c, best_v = c, j
-        individual[2][i] = [best_v]
-    return individual
-
-
-def _split_overcapacity_routes(individual, parameters, capacity, max_iter=64):
-    """Split routes whose cumulative load exceeds capacity into feasible+overflow halves."""
-    for _ in range(max_iter):
-        solution = [[], [], []]
-        changed = False
-        for i in range(len(individual[0])):
-            cap = _evaluate_capacity(parameters, individual[0][i], individual[1][i])
-            cap_core = cap[1:-1]
-            cap_i = capacity[individual[2][i][0]]
-            if not cap_core or max(cap_core) <= cap_i:
-                solution[0].append(individual[0][i])
-                solution[1].append(individual[1][i])
-                solution[2].append(individual[2][i])
-                continue
-            sep = [x > cap_i for x in cap_core]
-            sub = individual[1][i]
-            sep_f = [sub[x] for x in range(len(sub)) if not sep[x]]
-            sep_t = [sub[x] for x in range(len(sub)) if sep[x]]
-            if sep_f and sep_t:
-                changed = True
-                solution[0].append(individual[0][i]); solution[0].append(individual[0][i])
-                solution[1].append(sep_f);            solution[1].append(sep_t)
-                solution[2].append(individual[2][i]); solution[2].append(individual[2][i])
-            elif sep_t:
-                solution[0].append(individual[0][i])
-                solution[1].append(sep_t)
-                solution[2].append(individual[2][i])
-            elif sep_f:
-                solution[0].append(individual[0][i])
-                solution[1].append(sep_f)
-                solution[2].append(individual[2][i])
-        individual = solution
-        if not changed:
-            break
-    return individual
-
-
-# ---------------------------------------------------------------------------
-# Population fitness + initial generation
-# ---------------------------------------------------------------------------
-
-def _target_function(population, distance_matrix, parameters, velocity, fixed_cost,
-                     variable_cost, capacity, penalty_value, time_window, route,
-                     fleet_size):
-    demand = parameters[:, 0]
-    tw_early = parameters[:, 1]; tw_late = parameters[:, 2]
-    tw_st = parameters[:, 3];   tw_wc = parameters[:, 4]
-    closed = 0 if route == "open" else 1
-    use_tw = (time_window == "with")
-    cost = [[0.0] for _ in population]
-
-    for k, individual in enumerate(population):
-        total = 0.0
-        flt_cnt = [0] * len(fleet_size)
-        for i in range(len(individual[1])):
-            subroute = individual[1][i]
-            if not subroute:
-                continue
-            v_type = individual[2][i][0]
-            depot_idx = individual[0][i][0]
-            sub_arr = np.asarray(subroute, dtype=np.int64)
-            if use_tw:
-                total += float(route_cost_time_windows(
-                    distance_matrix, demand, tw_early, tw_late, tw_st, tw_wc,
-                    depot_idx, sub_arr, velocity[v_type], fixed_cost[v_type],
-                    variable_cost[v_type], capacity[v_type], penalty_value, closed,
-                ))
-            else:
-                total += float(route_cost_basic(
-                    distance_matrix, demand, depot_idx, sub_arr,
-                    fixed_cost[v_type], variable_cost[v_type],
-                    capacity[v_type], penalty_value, closed,
-                ))
-            if fleet_size:
-                flt_cnt[v_type] += 1
-
-        pnlt = 0
-        if fleet_size:
-            for v in range(len(fleet_size)):
-                over = flt_cnt[v] - fleet_size[v]
-                if over > 0:
-                    pnlt += over
-        cost[k][0] = total + pnlt * penalty_value
-
-    return cost, population
-
-
-def _initial_population(distance_matrix, population_size, vehicle_types, n_depots, model):
-    if model == "tsp":
-        n_depots = 1
-    depots = [[i] for i in range(n_depots)]
-    vehicles = [[i] for i in range(vehicle_types)]
-    clients = list(range(n_depots, distance_matrix.shape[0]))
-    population = []
-    for _ in range(population_size):
-        remaining = clients[:]
-        routes, routes_depot, routes_vehicles = [], [], []
-        while remaining:
-            e = random.choice(vehicles)
-            d = random.choice(depots)
-            if model == "tsp":
-                c = random.sample(remaining, len(remaining))
-            else:
-                c = random.sample(remaining, random.randint(1, len(remaining)))
-            routes_vehicles.append(e[:])
-            routes_depot.append(d[:])
-            routes.append(c)
-            rem_set = set(c)
-            remaining = [x for x in remaining if x not in rem_set]
-        population.append([routes_depot, routes, routes_vehicles])
-    return population
-
-
-def _fitness_function(cost):
-    c = np.asarray([row[0] for row in cost], dtype=np.float64)
-    f = 1.0 / (1.0 + c + abs(c.min()))
-    cdf = np.cumsum(f) / f.sum()
-    return np.column_stack([f, cdf])
-
-
-def _roulette_wheel(fitness):
-    return int(np.searchsorted(fitness[:, 1], random.random(), side="left"))
-
-
-# ---------------------------------------------------------------------------
-# Crossovers + mutation
-# ---------------------------------------------------------------------------
-
-def _crossover_tsp_brbax(p1, p2):
-    offspring = _clone_individual(p2)
-    L = len(p1[1][0])
-    cut = sorted(random.sample(range(L), 2))
-    A = p1[1][0][cut[0]:cut[1]]
-    A_set = set(A)
-    B = [x for x in p2[1][0] if x not in A_set]
-    if random.random() > 0.5:
-        A = A[::-1]
-    offspring[1][0] = A + B
-    return offspring
-
-
-def _best_insertion(distance_matrix, depot_idx, subroute, A):
-    n = len(subroute)
-    if n == 0:
-        return 0, float(distance_matrix[depot_idx, A] + distance_matrix[A, depot_idx])
-    prev = np.empty(n + 1, dtype=np.int64); nxt = np.empty(n + 1, dtype=np.int64)
-    prev[0] = depot_idx; prev[1:] = subroute
-    nxt[:-1] = subroute; nxt[-1] = depot_idx
-    delta = (distance_matrix[prev, A] + distance_matrix[A, nxt]
-             - distance_matrix[prev, nxt])
-    pos = int(np.argmin(delta))
-    return pos, float(delta[pos])
-
-
-def _crossover_tsp_bcr(p1, p2, distance_matrix, velocity, capacity,
-                       fixed_cost, variable_cost, penalty_value, time_window,
-                       parameters, route):
-    offspring = _clone_individual(p2)
-    L = len(p1[1][0])
-    cut = random.sample(range(L), 2)
-    for idx in range(2):
-        A = p1[1][0][cut[idx]]
-        if A in offspring[1][0]:
-            offspring[1][0].remove(A)
-        depot_idx = offspring[0][0][0]
-        if time_window == "with":
-            sub = offspring[1][0]
-            v_type = offspring[2][0][0]
-            best_pos, best_cost = 0, float("inf")
-            for n in range(len(sub) + 1):
-                trial = sub[:n] + [A] + sub[n:]
-                c = _single_route_penalised_cost(
-                    distance_matrix, parameters, velocity, fixed_cost,
-                    variable_cost, capacity, penalty_value, time_window,
-                    route, offspring[0][0], trial, v_type,
-                )
-                if c < best_cost:
-                    best_cost, best_pos = c, n
-            offspring[1][0] = sub[:best_pos] + [A] + sub[best_pos:]
-        else:
-            pos, _ = _best_insertion(distance_matrix, depot_idx, offspring[1][0], A)
-            offspring[1][0].insert(pos, A)
-    return offspring
-
-
-def _crossover_vrp_brbax(p1, p2):
-    s = random.randrange(len(p1[0]))
-    sd, sr, sv = p1[0][s][:], p1[1][s][:], p1[2][s][:]
-    transferred = set(sr)
-    offspring = _clone_individual(p2)
-    for k in range(len(offspring[1]) - 1, -1, -1):
-        offspring[1][k] = [x for x in offspring[1][k] if x not in transferred]
-        if not offspring[1][k]:
-            del offspring[0][k]; del offspring[1][k]; del offspring[2][k]
-    offspring[0].append(sd); offspring[1].append(sr); offspring[2].append(sv)
-    return offspring
-
-
-def _crossover_vrp_bcr(p1, p2, distance_matrix, velocity, capacity,
-                       fixed_cost, variable_cost, penalty_value, time_window,
-                       parameters, route):
-    s = random.randrange(len(p1[0]))
-    offspring = _clone_individual(p2)
-    demand_col = parameters[:, 0]
-    route_demands = [_route_demand_sum(rt, demand_col) for rt in offspring[1]]
-
-    if len(p1[1][s]) > 1:
-        cut = random.sample(range(len(p1[1][s])), 2); gene = 2
-    else:
-        cut = [0, 0]; gene = 1
-
-    for idx in range(gene):
-        A = p1[1][s][cut[idx]]
-        demand_A = demand_col[A]
-        for m in range(len(offspring[1])):
-            if A in offspring[1][m]:
-                offspring[1][m].remove(A)
-                route_demands[m] -= demand_A
-                break
-
-        best_m, best_pos, best_delta = 0, 0, float("inf")
-        if time_window == "with":
-            for m in range(len(offspring[1])):
-                depot = offspring[0][m]
-                sub = offspring[1][m]
-                v_type = offspring[2][m][0]
-                for n in range(len(sub) + 1):
-                    trial = sub[:n] + [A] + sub[n:]
-                    c = _single_route_penalised_cost(
-                        distance_matrix, parameters, velocity, fixed_cost,
-                        variable_cost, capacity, penalty_value, time_window,
-                        route, depot, trial, v_type,
-                    )
-                    if c < best_delta:
-                        best_delta, best_m, best_pos = c, m, n
-        else:
-            for m in range(len(offspring[1])):
-                depot_idx = offspring[0][m][0]
-                pos, delta = _best_insertion(distance_matrix, depot_idx, offspring[1][m], A)
-                v_type = offspring[2][m][0]
-                score = delta + (penalty_value if route_demands[m] + demand_A > capacity[v_type] else 0.0)
-                if score < best_delta:
-                    best_delta, best_m, best_pos = score, m, pos
-
-        offspring[1][best_m].insert(best_pos, A)
-        route_demands[best_m] += demand_A
-
-    for i in range(len(offspring[1]) - 1, -1, -1):
-        if not offspring[1][i]:
-            del offspring[0][i]; del offspring[1][i]; del offspring[2][i]
-            del route_demands[i]
-    return offspring
-
-
-def _breeding(cost, population, fitness, distance_matrix, n_depots, elite, velocity,
-              capacity, fixed_cost, variable_cost, penalty_value, time_window,
-              parameters, route, vehicle_types):
-    if elite > 0:
-        order = sorted(range(len(population)), key=lambda i: cost[i][0])
-        population = [population[i] for i in order]
-        cost = [cost[i] for i in order]
-        offspring = [_clone_individual(population[i]) for i in range(elite)]
-        offspring.extend([None] * (len(population) - elite))
-    else:
-        offspring = [None] * len(population)
-
-    pop_len = len(population)
-    for i in range(elite, pop_len):
-        p1 = _roulette_wheel(fitness)
-        p2 = _roulette_wheel(fitness)
-        while p1 == p2:
-            p2 = random.randrange(pop_len)
-        parent_1, parent_2 = population[p1], population[p2]
-        r = random.random()
-
-        if len(parent_1[1]) == 1 and len(parent_2[1]) == 1:
-            if r > 0.5:
-                child = _crossover_tsp_brbax(parent_1, parent_2)
-                child = _crossover_tsp_bcr(child, parent_2, distance_matrix, velocity,
-                                           capacity, fixed_cost, variable_cost,
-                                           penalty_value, time_window, parameters, route)
-            else:
-                child = _crossover_tsp_brbax(parent_2, parent_1)
-                child = _crossover_tsp_bcr(child, parent_1, distance_matrix, velocity,
-                                           capacity, fixed_cost, variable_cost,
-                                           penalty_value, time_window, parameters, route)
-        elif len(parent_1[1]) > 1 and len(parent_2[1]) > 1:
-            if r > 0.5:
-                child = _crossover_vrp_brbax(parent_1, parent_2)
-                child = _crossover_vrp_bcr(child, parent_2, distance_matrix, velocity,
-                                           capacity, fixed_cost, variable_cost,
-                                           penalty_value, time_window, parameters, route)
-            else:
-                child = _crossover_vrp_brbax(parent_2, parent_1)
-                child = _crossover_vrp_bcr(child, parent_1, distance_matrix, velocity,
-                                           capacity, fixed_cost, variable_cost,
-                                           penalty_value, time_window, parameters, route)
-        else:
-            child = _clone_individual(parent_1 if len(parent_1[1]) > len(parent_2[1]) else parent_2)
-
-        if n_depots > 1:
-            child = _reassign_depots(n_depots, child, distance_matrix)
-        if vehicle_types > 1:
-            child = _reassign_vehicles(vehicle_types, child, distance_matrix, parameters,
-                                       velocity, fixed_cost, variable_cost, capacity,
-                                       penalty_value, time_window, route)
-        child = _split_overcapacity_routes(child, parameters, capacity)
-        offspring[i] = child
-    return offspring
-
-
-def _mutation_swap(individual):
-    if len(individual[1]) == 1:
-        k1 = k2 = 0
-    else:
-        k1, k2 = random.sample(range(len(individual[1])), 2)
-    c1 = random.randrange(len(individual[1][k1]))
-    c2 = random.randrange(len(individual[1][k2]))
-    individual[1][k1][c1], individual[1][k2][c2] = individual[1][k2][c2], individual[1][k1][c1]
-    return individual
-
-
-def _mutation_insertion(individual):
-    if len(individual[1]) == 1:
-        k1 = k2 = 0
-    else:
-        k1, k2 = random.sample(range(len(individual[1])), 2)
-    c1 = random.randrange(len(individual[1][k1]))
-    c2 = random.randrange(len(individual[1][k2]) + 1)
-    A = individual[1][k1].pop(c1)
-    individual[1][k2].insert(c2, A)
-    if not individual[1][k1]:
-        del individual[0][k1]; del individual[1][k1]; del individual[2][k1]
-    return individual
-
-
-def _mutate_population(offspring, mutation_rate, elite):
-    for i in range(elite, len(offspring)):
-        if random.random() <= mutation_rate:
-            if random.random() <= 0.5:
-                offspring[i] = _mutation_insertion(offspring[i])
-            else:
-                offspring[i] = _mutation_swap(offspring[i])
-        for k in range(len(offspring[i][1])):
-            if len(offspring[i][1][k]) >= 2 and random.random() <= mutation_rate:
-                cut = sorted(random.sample(range(len(offspring[i][1][k])), 2))
-                segment = offspring[i][1][k][cut[0]:cut[1] + 1]
-                if random.random() <= 0.5:
-                    random.shuffle(segment)
-                else:
-                    segment.reverse()
-                offspring[i][1][k][cut[0]:cut[1] + 1] = segment
-    return offspring
-
-
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
-
-def _elite_distance(individual, distance_matrix, route):
-    end = 2 if route == "open" else 1
-    td = 0.0
-    for n in range(len(individual[1])):
-        td += _evaluate_distance(distance_matrix, individual[0][n], individual[1][n])[-end]
-    return round(td, 2)
 
 
 def _build_report(solution, distance_matrix, parameters, velocity, fixed_cost,
@@ -584,7 +139,722 @@ def _build_report(solution, distance_matrix, parameters, velocity, fixed_cost,
 
 
 # ---------------------------------------------------------------------------
-# Public engine driver
+# Hybrid GA internals
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RouteState:
+    depot: int
+    vehicle: int
+    stops: List[int]
+    distance: float
+    cost: float
+    wait_cost: float
+    cap_violation: float
+    tw_violation: float
+    feasible: bool
+
+
+@dataclass
+class Candidate:
+    perm: List[int]
+    raw: List[List[List[int]]]
+    total_distance: float
+    total_cost: float
+    cap_violation: float
+    tw_violation: float
+    fleet_violation: float
+    feasible: bool
+    n_routes: int
+
+    @property
+    def violation(self) -> float:
+        return self.cap_violation + self.tw_violation + self.fleet_violation
+
+    @property
+    def sort_key(self):
+        return (
+            0 if self.feasible else 1,
+            round(self.violation, 8),
+            round(self.total_cost, 8),
+            round(self.total_distance, 8),
+            len(self.perm),
+        )
+
+
+def _clone_raw(raw):
+    return [[d[:] for d in raw[0]], [r[:] for r in raw[1]], [v[:] for v in raw[2]]]
+
+
+def _flatten_raw(raw: List[List[List[int]]]) -> List[int]:
+    perm: List[int] = []
+    for route in raw[1]:
+        perm.extend(route)
+    return perm
+
+
+def _route_eval(
+    distance_matrix: np.ndarray,
+    parameters: np.ndarray,
+    route_mode: str,
+    depot: int,
+    vehicle: int,
+    stops: Sequence[int],
+    velocity: Sequence[float],
+    fixed_cost: Sequence[float],
+    variable_cost: Sequence[float],
+    capacity: Sequence[float],
+    tw_enabled: bool,
+    cap_penalty: float,
+    tw_penalty: float,
+) -> RouteState:
+    stops = list(stops)
+    if not stops:
+        return RouteState(depot, vehicle, [], 0.0, 0.0, 0.0, 0.0, 0.0, True)
+
+    demand = parameters[:, 0]
+    tw_early = parameters[:, 1]
+    tw_late = parameters[:, 2]
+    tw_service = parameters[:, 3]
+    tw_wait_cost = parameters[:, 4]
+
+    prev = depot
+    current_time = 0.0
+    load = 0.0
+    total_distance = 0.0
+    wait_cost_total = 0.0
+    cap_violation = 0.0
+    tw_violation = 0.0
+    vel = max(float(velocity[vehicle]), 1e-12)
+    cap_limit = float(capacity[vehicle])
+
+    for node in stops:
+        leg = float(distance_matrix[prev, node])
+        total_distance += leg
+        arrival = current_time + leg / vel
+        start_service = arrival
+        if tw_enabled and arrival < tw_early[node]:
+            wait = tw_early[node] - arrival
+            wait_cost_total += wait * tw_wait_cost[node]
+            start_service = tw_early[node]
+        if tw_enabled and start_service > tw_late[node]:
+            tw_violation += start_service - tw_late[node]
+        current_time = start_service + tw_service[node]
+        load += demand[node]
+        if math.isfinite(cap_limit) and load > cap_limit:
+            cap_violation += load - cap_limit
+        prev = node
+
+    if route_mode == "closed":
+        leg = float(distance_matrix[prev, depot])
+        total_distance += leg
+        arrival = current_time + leg / vel
+        start_service = arrival
+        if tw_enabled and arrival < tw_early[depot]:
+            wait = tw_early[depot] - arrival
+            wait_cost_total += wait * tw_wait_cost[depot]
+            start_service = tw_early[depot]
+        if tw_enabled and start_service > tw_late[depot]:
+            tw_violation += start_service - tw_late[depot]
+
+    total_cost = (
+        float(fixed_cost[vehicle])
+        + total_distance * float(variable_cost[vehicle])
+        + wait_cost_total
+        + cap_penalty * cap_violation
+        + tw_penalty * tw_violation
+    )
+    feasible = (cap_violation <= 1e-9 and tw_violation <= 1e-9)
+    return RouteState(
+        depot=depot,
+        vehicle=vehicle,
+        stops=stops,
+        distance=total_distance,
+        cost=total_cost,
+        wait_cost=wait_cost_total,
+        cap_violation=cap_violation,
+        tw_violation=tw_violation,
+        feasible=feasible,
+    )
+
+
+def _route_eval_all_types(
+    distance_matrix: np.ndarray,
+    parameters: np.ndarray,
+    route_mode: str,
+    depot: int,
+    stops: Sequence[int],
+    velocity: Sequence[float],
+    fixed_cost: Sequence[float],
+    variable_cost: Sequence[float],
+    capacity: Sequence[float],
+    tw_enabled: bool,
+    cap_penalty: float,
+    tw_penalty: float,
+) -> List[RouteState]:
+    return [
+        _route_eval(distance_matrix, parameters, route_mode, depot, v, stops,
+                    velocity, fixed_cost, variable_cost, capacity,
+                    tw_enabled, cap_penalty, tw_penalty)
+        for v in range(len(capacity))
+    ]
+
+
+def _best_route_for_segment(
+    distance_matrix: np.ndarray,
+    parameters: np.ndarray,
+    route_mode: str,
+    depots: Sequence[int],
+    vehicle_types: Sequence[int],
+    stops: Sequence[int],
+    velocity: Sequence[float],
+    fixed_cost: Sequence[float],
+    variable_cost: Sequence[float],
+    capacity: Sequence[float],
+    tw_enabled: bool,
+    cap_penalty: float,
+    tw_penalty: float,
+) -> RouteState:
+    best = None
+    for depot in depots:
+        for vehicle in vehicle_types:
+            route = _route_eval(distance_matrix, parameters, route_mode, depot, vehicle, stops,
+                                velocity, fixed_cost, variable_cost, capacity,
+                                tw_enabled, cap_penalty, tw_penalty)
+            if best is None or (
+                (0 if route.feasible else 1, route.cap_violation + route.tw_violation, route.cost, route.distance)
+                < (0 if best.feasible else 1, best.cap_violation + best.tw_violation, best.cost, best.distance)
+            ):
+                best = route
+    assert best is not None
+    return best
+
+
+def _segment_cache(
+    perm: Sequence[int],
+    distance_matrix: np.ndarray,
+    parameters: np.ndarray,
+    n_depots: int,
+    velocity: Sequence[float],
+    fixed_cost: Sequence[float],
+    variable_cost: Sequence[float],
+    capacity: Sequence[float],
+    route_mode: str,
+    tw_enabled: bool,
+    cap_penalty: float,
+    tw_penalty: float,
+) -> List[List[RouteState]]:
+    n = len(perm)
+    depots = list(range(n_depots))
+    vehicle_types = list(range(len(capacity)))
+    cache: List[List[RouteState]] = [[None] * n for _ in range(n)]  # type: ignore[list-item]
+    # O(n^2 * depots * vehicle_types * avg segment length). Simpler and robust.
+    for i in range(n):
+        stops: List[int] = []
+        for j in range(i, n):
+            stops.append(perm[j])
+            cache[i][j] = _best_route_for_segment(
+                distance_matrix, parameters, route_mode, depots, vehicle_types, stops,
+                velocity, fixed_cost, variable_cost, capacity,
+                tw_enabled, cap_penalty, tw_penalty,
+            )
+    return cache
+
+
+def _decode_split(
+    perm: Sequence[int],
+    distance_matrix: np.ndarray,
+    parameters: np.ndarray,
+    n_depots: int,
+    velocity: Sequence[float],
+    fixed_cost: Sequence[float],
+    variable_cost: Sequence[float],
+    capacity: Sequence[float],
+    fleet_size: Sequence[int],
+    route_mode: str,
+    model: str,
+    tw_enabled: bool,
+    cap_penalty: float,
+    tw_penalty: float,
+) -> List[RouteState]:
+    n = len(perm)
+    if n == 0:
+        return []
+    seg = _segment_cache(perm, distance_matrix, parameters, n_depots,
+                         velocity, fixed_cost, variable_cost, capacity,
+                         route_mode, tw_enabled, cap_penalty, tw_penalty)
+
+    exact_routes = None
+    max_routes = None
+    if fleet_size:
+        max_routes = max(1, min(sum(int(x) for x in fleet_size), n))
+        if model == "mtsp":
+            exact_routes = max_routes
+    if model == "tsp":
+        exact_routes = 1
+        max_routes = 1
+
+    if max_routes is None:
+        dp = [float("inf")] * (n + 1)
+        prev = [-1] * (n + 1)
+        dp[0] = 0.0
+        for j in range(1, n + 1):
+            best_val = float("inf")
+            best_i = -1
+            for i in range(j):
+                state = seg[i][j - 1]
+                val = dp[i] + state.cost
+                if val < best_val:
+                    best_val = val
+                    best_i = i
+            dp[j] = best_val
+            prev[j] = best_i
+        cuts: List[Tuple[int, int]] = []
+        cur = n
+        while cur > 0:
+            i = prev[cur]
+            cuts.append((i, cur - 1))
+            cur = i
+        cuts.reverse()
+        return [seg[i][j] for (i, j) in cuts]
+
+    # bounded-route DP
+    dp = [[float("inf")] * (n + 1) for _ in range(max_routes + 1)]
+    prev: List[List[Tuple[int, int]]] = [[(-1, -1)] * (n + 1) for _ in range(max_routes + 1)]
+    dp[0][0] = 0.0
+    for k in range(1, max_routes + 1):
+        for j in range(1, n + 1):
+            best_val = float("inf")
+            best_i = -1
+            for i in range(j):
+                if dp[k - 1][i] == float("inf"):
+                    continue
+                state = seg[i][j - 1]
+                val = dp[k - 1][i] + state.cost
+                if val < best_val:
+                    best_val = val
+                    best_i = i
+            dp[k][j] = best_val
+            prev[k][j] = (k - 1, best_i)
+
+    if exact_routes is not None:
+        best_k = exact_routes
+    else:
+        candidates = [(dp[k][n], k) for k in range(1, max_routes + 1)]
+        best_k = min(candidates)[1]
+
+    cuts: List[Tuple[int, int]] = []
+    k = best_k
+    cur = n
+    while cur > 0 and k >= 1:
+        pk, i = prev[k][cur]
+        if i < 0:
+            break
+        cuts.append((i, cur - 1))
+        cur = i
+        k = pk
+    cuts.reverse()
+    if not cuts:
+        return [seg[0][n - 1]]
+    return [seg[i][j] for (i, j) in cuts]
+
+
+def _repair_vehicle_counts(
+    routes: List[RouteState],
+    distance_matrix: np.ndarray,
+    parameters: np.ndarray,
+    route_mode: str,
+    velocity: Sequence[float],
+    fixed_cost: Sequence[float],
+    variable_cost: Sequence[float],
+    capacity: Sequence[float],
+    fleet_size: Sequence[int],
+    tw_enabled: bool,
+    cap_penalty: float,
+    tw_penalty: float,
+) -> Tuple[List[RouteState], float]:
+    if not fleet_size:
+        return routes, 0.0
+    counts = [0] * len(fleet_size)
+    for r in routes:
+        if r.vehicle < len(counts):
+            counts[r.vehicle] += 1
+
+    total_excess = 0.0
+    routes = list(routes)
+    while True:
+        over_types = [i for i, c in enumerate(counts) if c > fleet_size[i]]
+        under_types = [i for i, c in enumerate(counts) if c < fleet_size[i]]
+        if not over_types:
+            break
+        if not under_types:
+            total_excess = sum(max(0, counts[i] - fleet_size[i]) for i in range(len(counts)))
+            break
+
+        best_delta = None
+        best_idx = None
+        best_new = None
+        for vt in over_types:
+            for idx, route in enumerate(routes):
+                if route.vehicle != vt:
+                    continue
+                for alt in under_types:
+                    candidate = _route_eval(distance_matrix, parameters, route_mode,
+                                            route.depot, alt, route.stops,
+                                            velocity, fixed_cost, variable_cost, capacity,
+                                            tw_enabled, cap_penalty, tw_penalty)
+                    delta = candidate.cost - route.cost
+                    key = ((0 if candidate.feasible else 1), delta, candidate.distance)
+                    if best_delta is None or key < best_delta:
+                        best_delta = key
+                        best_idx = idx
+                        best_new = candidate
+        if best_idx is None or best_new is None:
+            total_excess = sum(max(0, counts[i] - fleet_size[i]) for i in range(len(counts)))
+            break
+        old_v = routes[best_idx].vehicle
+        counts[old_v] -= 1
+        counts[best_new.vehicle] += 1
+        routes[best_idx] = best_new
+    return routes, total_excess
+
+
+def _routes_to_raw(routes: Sequence[RouteState]) -> List[List[List[int]]]:
+    depots = [[int(r.depot)] for r in routes if r.stops]
+    stops = [[int(x) for x in r.stops] for r in routes if r.stops]
+    vehicles = [[int(r.vehicle)] for r in routes if r.stops]
+    return [depots, stops, vehicles]
+
+
+def _candidate_from_perm(
+    perm: Sequence[int],
+    distance_matrix: np.ndarray,
+    parameters: np.ndarray,
+    velocity: Sequence[float],
+    fixed_cost: Sequence[float],
+    variable_cost: Sequence[float],
+    capacity: Sequence[float],
+    n_depots: int,
+    route_mode: str,
+    model: str,
+    fleet_size: Sequence[int],
+    tw_enabled: bool,
+    cap_penalty: float,
+    tw_penalty: float,
+    apply_local_search: bool = True,
+) -> Candidate:
+    routes = _decode_split(perm, distance_matrix, parameters, n_depots,
+                           velocity, fixed_cost, variable_cost, capacity,
+                           fleet_size, route_mode, model, tw_enabled,
+                           cap_penalty, tw_penalty)
+    if apply_local_search:
+        routes = _local_search(routes, distance_matrix, parameters, velocity,
+                               fixed_cost, variable_cost, capacity,
+                               route_mode, tw_enabled, cap_penalty, tw_penalty,
+                               model)
+        # For mTSP with an explicit fleet size, every salesman should correspond
+        # to a non-empty route. Local search may temporarily collapse routes, so
+        # we re-decode the improved customer order under the exact-route split.
+        if model == "mtsp" and fleet_size:
+            routes = _decode_split(_flatten_raw(_routes_to_raw(routes)), distance_matrix,
+                                   parameters, n_depots, velocity, fixed_cost,
+                                   variable_cost, capacity, fleet_size,
+                                   route_mode, model, tw_enabled,
+                                   cap_penalty, tw_penalty)
+    routes, fleet_violation = _repair_vehicle_counts(
+        routes, distance_matrix, parameters, route_mode,
+        velocity, fixed_cost, variable_cost, capacity,
+        fleet_size, tw_enabled, cap_penalty, tw_penalty,
+    )
+    total_distance = sum(r.distance for r in routes)
+    total_cost = sum(r.cost for r in routes)
+    cap_violation = sum(r.cap_violation for r in routes)
+    tw_violation = sum(r.tw_violation for r in routes)
+    feasible = (cap_violation <= 1e-9 and tw_violation <= 1e-9 and fleet_violation <= 1e-9)
+    raw = _routes_to_raw(routes)
+    return Candidate(
+        perm=list(_flatten_raw(raw)),
+        raw=raw,
+        total_distance=total_distance,
+        total_cost=total_cost + (fleet_violation * cap_penalty),
+        cap_violation=cap_violation,
+        tw_violation=tw_violation,
+        fleet_violation=fleet_violation,
+        feasible=feasible,
+        n_routes=len(raw[1]),
+    )
+
+
+def _tournament(population: Sequence[Candidate], size: int = 3) -> Candidate:
+    choices = random.sample(range(len(population)), k=min(size, len(population)))
+    best = min((population[i] for i in choices), key=lambda x: x.sort_key)
+    return best
+
+
+def _roulette(population: Sequence[Candidate], rank_mode: bool = False) -> Candidate:
+    ordered = sorted(population, key=lambda x: x.sort_key)
+    if rank_mode:
+        weights = np.arange(len(ordered), 0, -1, dtype=float)
+    else:
+        scores = np.array([c.total_cost + c.violation * 1000.0 for c in ordered], dtype=float)
+        scores -= scores.min()
+        weights = 1.0 / (1.0 + scores)
+    probs = weights / weights.sum()
+    idx = np.random.choice(len(ordered), p=probs)
+    return ordered[int(idx)]
+
+
+def _select_parent(population: Sequence[Candidate], selection: str) -> Candidate:
+    if selection == "rw":
+        return _roulette(population, rank_mode=False)
+    if selection == "rank":
+        return _roulette(population, rank_mode=True)
+    return _tournament(population)
+
+
+def _order_crossover(p1: Sequence[int], p2: Sequence[int]) -> List[int]:
+    n = len(p1)
+    if n <= 1:
+        return list(p1)
+    a, b = sorted(random.sample(range(n), 2))
+    child = [None] * n
+    child[a:b + 1] = p1[a:b + 1]
+    used = set(p1[a:b + 1])
+    fill = [x for x in p2 if x not in used]
+    idx = 0
+    for i in range(n):
+        if child[i] is None:
+            child[i] = fill[idx]
+            idx += 1
+    return [int(x) for x in child]
+
+
+def _route_based_crossover(c1: Candidate, c2: Candidate) -> List[int]:
+    if not c1.raw[1] or not c2.raw[1]:
+        return _order_crossover(c1.perm, c2.perm)
+    donor = random.choice(c1.raw[1])
+    donor_set = set(donor)
+    base = [x for x in c2.perm if x not in donor_set]
+    if not base:
+        return list(donor)
+    insert_pos = random.randint(0, len(base))
+    child = base[:insert_pos] + donor[:] + base[insert_pos:]
+    return child
+
+
+def _mutate_perm(perm: List[int]) -> List[int]:
+    n = len(perm)
+    if n <= 1:
+        return perm
+    r = random.random()
+    if r < 0.34:
+        i, j = random.sample(range(n), 2)
+        perm[i], perm[j] = perm[j], perm[i]
+    elif r < 0.67:
+        i, j = random.sample(range(n), 2)
+        item = perm.pop(i)
+        perm.insert(j, item)
+    else:
+        i, j = sorted(random.sample(range(n), 2))
+        perm[i:j + 1] = reversed(perm[i:j + 1])
+    return perm
+
+
+def _try_two_opt(route: RouteState, distance_matrix, parameters, velocity,
+                 fixed_cost, variable_cost, capacity, route_mode,
+                 tw_enabled, cap_penalty, tw_penalty) -> RouteState:
+    best = route
+    stops = route.stops
+    n = len(stops)
+    if n < 4:
+        return best
+    improved = True
+    while improved:
+        improved = False
+        for i in range(n - 2):
+            for j in range(i + 2, n):
+                cand_stops = stops[:i] + list(reversed(stops[i:j + 1])) + stops[j + 1:]
+                cand = _route_eval(distance_matrix, parameters, route_mode, route.depot, route.vehicle,
+                                   cand_stops, velocity, fixed_cost, variable_cost, capacity,
+                                   tw_enabled, cap_penalty, tw_penalty)
+                if ((0 if cand.feasible else 1, cand.cap_violation + cand.tw_violation, cand.cost, cand.distance)
+                        < (0 if best.feasible else 1, best.cap_violation + best.tw_violation, best.cost, best.distance)):
+                    best = cand
+                    stops = cand.stops
+                    n = len(stops)
+                    improved = True
+                    break
+            if improved:
+                break
+    return best
+
+
+def _local_search(routes: List[RouteState], distance_matrix, parameters, velocity,
+                  fixed_cost, variable_cost, capacity, route_mode, tw_enabled,
+                  cap_penalty, tw_penalty, model: str) -> List[RouteState]:
+    if not routes:
+        return routes
+    routes = [RouteState(r.depot, r.vehicle, r.stops[:], r.distance, r.cost, r.wait_cost,
+                         r.cap_violation, r.tw_violation, r.feasible)
+              for r in routes]
+
+    # Intra-route improvement
+    for idx, route in enumerate(routes):
+        if model == "tsp" or len(route.stops) <= 60:
+            routes[idx] = _try_two_opt(route, distance_matrix, parameters, velocity,
+                                       fixed_cost, variable_cost, capacity, route_mode,
+                                       tw_enabled, cap_penalty, tw_penalty)
+
+    # Inter-route relocate / swap (first improvement, bounded effort)
+    max_passes = 3
+    for _ in range(max_passes):
+        improved = False
+        current_score = sum(r.cost for r in routes), sum(r.cap_violation + r.tw_violation for r in routes)
+        # relocate
+        for a in range(len(routes)):
+            if improved:
+                break
+            for b in range(len(routes)):
+                if a == b and len(routes[a].stops) <= 1:
+                    continue
+                for i in range(len(routes[a].stops)):
+                    node = routes[a].stops[i]
+                    base_a = routes[a].stops[:i] + routes[a].stops[i + 1:]
+                    b_positions = range(len(routes[b].stops) + 1)
+                    for pos in b_positions:
+                        if a == b and (pos == i or pos == i + 1):
+                            continue
+                        cand_a_stops = base_a if a != b else None
+                        if a == b:
+                            temp = routes[a].stops[:]
+                            moved = temp.pop(i)
+                            temp.insert(pos if pos <= len(temp) else len(temp), moved)
+                            cand = _route_eval(distance_matrix, parameters, route_mode,
+                                               routes[a].depot, routes[a].vehicle, temp,
+                                               velocity, fixed_cost, variable_cost, capacity,
+                                               tw_enabled, cap_penalty, tw_penalty)
+                            if ((0 if cand.feasible else 1, cand.cap_violation + cand.tw_violation, cand.cost)
+                                    < (0 if routes[a].feasible else 1, routes[a].cap_violation + routes[a].tw_violation, routes[a].cost)):
+                                routes[a] = cand
+                                improved = True
+                                break
+                        else:
+                            cand_a = _route_eval(distance_matrix, parameters, route_mode,
+                                                 routes[a].depot, routes[a].vehicle, base_a,
+                                                 velocity, fixed_cost, variable_cost, capacity,
+                                                 tw_enabled, cap_penalty, tw_penalty)
+                            temp_b = routes[b].stops[:]
+                            temp_b.insert(pos, node)
+                            cand_b = _route_eval(distance_matrix, parameters, route_mode,
+                                                 routes[b].depot, routes[b].vehicle, temp_b,
+                                                 velocity, fixed_cost, variable_cost, capacity,
+                                                 tw_enabled, cap_penalty, tw_penalty)
+                            old_key = (0 if routes[a].feasible and routes[b].feasible else 1,
+                                       routes[a].cap_violation + routes[a].tw_violation + routes[b].cap_violation + routes[b].tw_violation,
+                                       routes[a].cost + routes[b].cost)
+                            new_key = (0 if cand_a.feasible and cand_b.feasible else 1,
+                                       cand_a.cap_violation + cand_a.tw_violation + cand_b.cap_violation + cand_b.tw_violation,
+                                       cand_a.cost + cand_b.cost)
+                            if new_key < old_key:
+                                routes[a] = cand_a
+                                routes[b] = cand_b
+                                if not routes[a].stops:
+                                    del routes[a]
+                                improved = True
+                                break
+                    if improved:
+                        break
+                if improved:
+                    break
+        if improved:
+            continue
+        # swap
+        for a in range(len(routes)):
+            if improved:
+                break
+            for b in range(a + 1, len(routes)):
+                for i in range(len(routes[a].stops)):
+                    for j in range(len(routes[b].stops)):
+                        ra = routes[a].stops[:]
+                        rb = routes[b].stops[:]
+                        ra[i], rb[j] = rb[j], ra[i]
+                        cand_a = _route_eval(distance_matrix, parameters, route_mode,
+                                             routes[a].depot, routes[a].vehicle, ra,
+                                             velocity, fixed_cost, variable_cost, capacity,
+                                             tw_enabled, cap_penalty, tw_penalty)
+                        cand_b = _route_eval(distance_matrix, parameters, route_mode,
+                                             routes[b].depot, routes[b].vehicle, rb,
+                                             velocity, fixed_cost, variable_cost, capacity,
+                                             tw_enabled, cap_penalty, tw_penalty)
+                        old_key = (0 if routes[a].feasible and routes[b].feasible else 1,
+                                   routes[a].cap_violation + routes[a].tw_violation + routes[b].cap_violation + routes[b].tw_violation,
+                                   routes[a].cost + routes[b].cost)
+                        new_key = (0 if cand_a.feasible and cand_b.feasible else 1,
+                                   cand_a.cap_violation + cand_a.tw_violation + cand_b.cap_violation + cand_b.tw_violation,
+                                   cand_a.cost + cand_b.cost)
+                        if new_key < old_key:
+                            routes[a] = cand_a
+                            routes[b] = cand_b
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+        if not improved:
+            break
+    return [r for r in routes if r.stops]
+
+
+def _randomized_greedy_perm(customers: Sequence[int], distance_matrix: np.ndarray, n_depots: int) -> List[int]:
+    customers = list(customers)
+    if not customers:
+        return []
+    current = random.choice(list(range(n_depots)))
+    remaining = set(customers)
+    perm: List[int] = []
+    while remaining:
+        ranked = sorted(remaining, key=lambda x: distance_matrix[current, x])
+        rcl = ranked[:max(1, min(5, len(ranked)))]
+        nxt = random.choice(rcl)
+        perm.append(nxt)
+        remaining.remove(nxt)
+        current = nxt
+    return perm
+
+
+def _sweep_perm(customers: Sequence[int], coordinates: np.ndarray, depot_idx: int = 0) -> List[int]:
+    if not customers:
+        return []
+    depot = coordinates[depot_idx]
+    angles = []
+    for c in customers:
+        dx = coordinates[c, 0] - depot[0]
+        dy = coordinates[c, 1] - depot[1]
+        angles.append((math.atan2(dy, dx), c))
+    angles.sort()
+    return [c for _, c in angles]
+
+
+def _initial_population(customers: Sequence[int], coordinates: np.ndarray, distance_matrix: np.ndarray,
+                        population_size: int, n_depots: int) -> List[List[int]]:
+    customers = list(customers)
+    pop: List[List[int]] = []
+    if customers:
+        pop.append(_sweep_perm(customers, coordinates, 0))
+        pop.append(list(reversed(pop[0])))
+        pop.append(_randomized_greedy_perm(customers, distance_matrix, n_depots))
+    while len(pop) < population_size:
+        perm = customers[:]
+        random.shuffle(perm)
+        if random.random() < 0.35:
+            perm = _randomized_greedy_perm(customers, distance_matrix, n_depots)
+        pop.append(perm)
+    return pop[:population_size]
+
+
+# ---------------------------------------------------------------------------
+# Public driver
 # ---------------------------------------------------------------------------
 
 def run_genetic_algorithm(
@@ -612,85 +882,96 @@ def run_genetic_algorithm(
     verbose: bool = False,
     on_generation: Optional[Callable[[int, float, float], None]] = None,
 ) -> Tuple[pd.DataFrame, list, List[float]]:
-    """Run the GA and return ``(report_df, best_individual, history)``.
-
-    ``history`` is a list of best-distance values per generation, useful
-    for plotting convergence.
-    """
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
 
-    fleet_size = list(fleet_size)
-    parameters = parameters.copy()  # we zero out depot demands below
+    parameters = parameters.copy()
+    for i in range(n_depots):
+        parameters[i, 0] = 0.0
 
-    start = tm.time()
-    max_capacity = list(capacity)
+    tw_enabled = (time_window == "with")
     if model == "tsp":
         n_depots = 1
-        max_capacity = [float("inf")] * len(max_capacity)
+        fleet_size = [1]
+        capacity = [float("inf")] * len(capacity)
     elif model == "mtsp":
-        max_capacity = [float("inf")] * len(max_capacity)
+        capacity = [float("inf")] * len(capacity)
 
-    for i in range(n_depots):
-        parameters[i, 0] = 0  # depots cannot have demand
+    customers = list(range(n_depots, distance_matrix.shape[0]))
+    if not customers:
+        raw = [[], [], []]
+        report = _build_report(raw, distance_matrix, parameters, velocity,
+                               fixed_cost, variable_cost, route=route, time_window=time_window)
+        return report, raw, [0.0]
 
-    population = _initial_population(distance_matrix, population_size,
-                                     vehicle_types, n_depots, model)
-    cost, population = _target_function(population, distance_matrix, parameters,
-                                        velocity, fixed_cost, variable_cost,
-                                        max_capacity, penalty_value,
-                                        time_window=time_window, route=route,
-                                        fleet_size=fleet_size)
-    order = sorted(range(len(cost)), key=lambda i: cost[i][0])
-    population = [population[i] for i in order]
-    cost = [cost[i] for i in order]
+    cap_penalty = float(penalty_value)
+    tw_penalty = float(penalty_value)
 
-    fitness = (_fitness_function(cost) if selection == "rw"
-               else _fitness_function([[i] for i in range(1, len(cost) + 1)]))
+    perms = _initial_population(customers, coordinates, distance_matrix, population_size, n_depots)
+    population = [
+        _candidate_from_perm(p, distance_matrix, parameters, velocity, fixed_cost, variable_cost,
+                             capacity, n_depots, route, model, list(fleet_size), tw_enabled,
+                             cap_penalty, tw_penalty, apply_local_search=True)
+        for p in perms
+    ]
+    population.sort(key=lambda x: x.sort_key)
+    best = population[0]
+    history = [round(best.total_distance, 2)]
 
-    elite_dist = _elite_distance(population[0], distance_matrix, route=route)
-    elite_cost = cost[0][0]
-    solution = _clone_individual(population[0])
-
-    history = [elite_dist]
     if verbose:
-        print(f"Generation 0  Distance = {elite_dist}  f(x) = {round(elite_cost, 2)}")
+        print(f"Generation 0  Distance = {best.total_distance:.2f}  f(x) = {best.total_cost:.2f}")
     if on_generation:
-        on_generation(0, elite_dist, elite_cost)
+        on_generation(0, best.total_distance, best.total_cost)
 
+    start = tm.time()
     for gen in range(1, generations + 1):
-        offspring = _breeding(cost, population, fitness, distance_matrix, n_depots,
-                              elite, velocity, max_capacity, fixed_cost, variable_cost,
-                              penalty_value, time_window, parameters, route, vehicle_types)
-        offspring = _mutate_population(offspring, mutation_rate=mutation_rate, elite=elite)
-        cost, population = _target_function(offspring, distance_matrix, parameters,
-                                            velocity, fixed_cost, variable_cost,
-                                            max_capacity, penalty_value,
-                                            time_window=time_window, route=route,
-                                            fleet_size=fleet_size)
-        order = sorted(range(len(cost)), key=lambda i: cost[i][0])
-        population = [population[i] for i in order]
-        cost = [cost[i] for i in order]
+        feasible_ratio = sum(1 for c in population if c.feasible) / max(1, len(population))
+        if tw_enabled or model == "vrp":
+            if feasible_ratio < 0.2:
+                cap_penalty *= 1.12
+                tw_penalty *= 1.12
+            elif feasible_ratio > 0.8:
+                cap_penalty *= 0.94
+                tw_penalty *= 0.94
+            cap_penalty = max(10.0, min(cap_penalty, penalty_value * 100.0))
+            tw_penalty = max(10.0, min(tw_penalty, penalty_value * 100.0))
 
-        elite_child = _elite_distance(population[0], distance_matrix, route=route)
-        fitness = (_fitness_function(cost) if selection == "rw"
-                   else _fitness_function([[i] for i in range(1, len(cost) + 1)]))
+        population.sort(key=lambda x: x.sort_key)
+        next_population: List[Candidate] = population[:max(0, elite)]
 
-        if elite_dist > elite_child:
-            elite_dist = elite_child
-            solution = _clone_individual(population[0])
-            elite_cost = cost[0][0]
+        while len(next_population) < population_size:
+            p1 = _select_parent(population, selection)
+            p2 = _select_parent(population, selection)
+            if random.random() < 0.5:
+                child_perm = _order_crossover(p1.perm, p2.perm)
+            else:
+                child_perm = _route_based_crossover(p1, p2)
+            if random.random() <= mutation_rate:
+                child_perm = _mutate_perm(child_perm[:])
+            # light second mutation on harder constrained cases
+            if (tw_enabled or model == "mtsp") and random.random() <= mutation_rate * 0.5:
+                child_perm = _mutate_perm(child_perm[:])
+            child = _candidate_from_perm(child_perm, distance_matrix, parameters,
+                                         velocity, fixed_cost, variable_cost, capacity,
+                                         n_depots, route, model, list(fleet_size),
+                                         tw_enabled, cap_penalty, tw_penalty,
+                                         apply_local_search=True)
+            next_population.append(child)
 
-        history.append(elite_dist)
+        population = sorted(next_population, key=lambda x: x.sort_key)[:population_size]
+        if population[0].sort_key < best.sort_key:
+            best = population[0]
+
+        history.append(round(best.total_distance, 2))
         if verbose:
-            print(f"Generation {gen}  Distance = {elite_dist}  f(x) = {round(elite_cost, 2)}")
+            print(f"Generation {gen}  Distance = {best.total_distance:.2f}  f(x) = {best.total_cost:.2f}")
         if on_generation:
-            on_generation(gen, elite_dist, elite_cost)
+            on_generation(gen, best.total_distance, best.total_cost)
 
-    report = _build_report(solution, distance_matrix, parameters, velocity,
+    report = _build_report(best.raw, distance_matrix, parameters, velocity,
                            fixed_cost, variable_cost, route=route,
                            time_window=time_window)
     if verbose:
         print(f"Algorithm time: {round(tm.time() - start, 2)} s")
-    return report, solution, history
+    return report, _clone_raw(best.raw), history
